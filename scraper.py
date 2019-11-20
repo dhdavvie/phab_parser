@@ -1,99 +1,111 @@
-from bs4 import BeautifulSoup
-import requests
 import time
-from datetime import datetime
+import re
+from phabricator import Phabricator
+import os
 
-URL = 'https://phabricator.services.mozilla.com/feed/transactions/'
+URL = "https://phabricator.services.mozilla.com/feed/transactions/"
 BASE_URL = "https://phabricator.services.mozilla.com"
+
+
+def map_feed_tuple(feed_tuple):
+    story_phid, feed_story = feed_tuple
+    feed_story.update({"storyPHID": story_phid})
+    return feed_story
 
 
 class PhabEventListener:
 
-    def __init__(self):
+    def __init__(self, config):
         self.running = True
         self.url = URL
         self.base_url = BASE_URL
-        self.timer_in_seconds = 60
+        self.timer_in_seconds = config['phabricator']['listener']['interval']
         self.queue = []
         self.latest = None
-        self.blacklist = ['added inline comments.',
-                          'added a comment.',
-                          'marked an inline comment as done.',
-                          'edited the summary of this revision.',
-                          'added a reviewer:',
-                          'added a subscriber:',
-                          'added a project:']
+        self.blacklist = ["added inline comments to D",
+                          "added a comment to D",
+                          "added a reviewer for D",
+                          "removed a reviewer for D",
+                          "requested review of D",
+                          "added a subscriber to D",
+                          "added a project to D"]
         self.datetime_format = "%a, %b %d, %I:%M %p"
+
+        self.phab = Phabricator(host='https://phabricator.services.mozilla.com/api/',
+                            token=config['phabricator']['token'])
+        self.phab.update_interfaces()
 
     def run(self):
         # Run until told to stop.
         while self.running:
-            resp = requests.get(self.url,
-                                headers={
-                                    'User-Agent': 'WptSync Bot / dheiberg@mozilla.com'
-                                })
-
-            if resp.status_code >= 400:
-                print("Error! Got response status %d. Response: %s" % (resp.status_code, resp.content))
-                self.running = False
-                continue
-
-            self.parse(resp)
-            print('Sleeping')
+            feed = self.get_feed()
+            print("Got feed: %s" % feed)
+            self.parse(feed)
             time.sleep(self.timer_in_seconds)
 
-    def parse(self, response):
-        soup = BeautifulSoup(response.content, 'html.parser')
+    def get_feed(self, before=None):
+        """ """
+        if self.latest and before is None:
+            before = int(self.latest['chronologicalKey'])
 
-        table = soup.find('table', {"class": "aphront-table-view"})
-        rows = table.find_all("tr")
-        assert rows[0].th.text == "Author"
+        done = False
+        feed = []
 
-        # Check if the events on this page will catch us up to our current state
-        last_cell = rows[-1].find_all("td")
-        last_timestamp = datetime.strptime(last_cell[3].text, self.datetime_format)
-        if self.latest is not None and last_timestamp >= self.latest['timestamp']:
-            # TODO We may need to paginate
-            print("Error, too far out of sync")
-            raise SystemExit
+        def chrono_key(feed_story_tuple):
+            return int(feed_story_tuple[1]["chronologicalKey"])
 
+        # keep fetching stories from Phabricator until there are no more stories to fetch
+        while not done:
+            result = self.phab.feed.query(before=before, view='text')
+            if result.response:
+                print("Response: %s" % result.response)
+                results = sorted(result.response.items(), key=chrono_key)
+                results = map(map_feed_tuple, results)
+                feed.extend(results)
+                if len(results) == 100 and before is not None:
+                    # There may be more events we wish to fetch
+                    before = int(results[-1]["chronologicalKey"])
+                    done = False
+                    continue
+            done = True
+        return feed
+
+    def parse(self, feed):
         latest = self.latest
         caught_up = False
 
         # Go through rows in reverse order, and ignore first row as it has the table headers
-        for row in rows[:0:-1]:
-            cells = row.find_all("td")
-            event = {
-                "author": cells[0].a.text,
-                "phab_object": cells[1].a['href'],
-                "transaction": self.parse_transaction(cells[2].div.span),
-                "timestamp": datetime.strptime(cells[3].text, self.datetime_format)
-            }
+        for event in feed:
 
-            # Check if we have reached the point where we will find new events
-            if latest is None or event == self.latest:
-                caught_up = True
-            elif not caught_up:
-                continue
+            # Split the text to get the part that describes the event type
+            event_text = re.compile("[0-9]{5}:").split(event['text'])[0]
 
             # Check if this is an event we wish to ignore
-            if len(event['transaction']) == 1 and event['transaction'][0] in self.blacklist:
-                # print("Discarded: %s" % event)
+            if any([event_type in event_text for event_type in self.blacklist]):
                 continue
 
             # Add the event to the queue, and set this as the latest parsed
             self.queue.append(event)
-            latest = event
-            print(event)
+            self.latest = event
+            print("Event", event['text'])
 
         # Update the latest to be the last event we parsed here
         self.latest = latest
 
-    def parse_transaction(self, transaction):
-        text = [s.strip() for s in transaction.children if isinstance(s, basestring) and s != '.']
-        return text
+
+def run_phabricator_listener(config):
+    listener = PhabEventListener(config)
+    listener.run()
 
 
 if __name__ == "__main__":
-    listener = PhabEventListener()
-    listener.run()
+    config = {
+        'phabricator': {
+            'listener': {
+                'interval': 60
+            },
+            'token': os.getenv('PHAB_TOKEN', None)
+        }
+    }
+
+    run_phabricator_listener(config)
